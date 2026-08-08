@@ -35,6 +35,9 @@ DEFAULT_HEIGHT = 844
 PROFILE_DIR = Path(os.environ.get("BROWSER_RELAY_PROFILE", str(Path.home() / ".browser-relay-profile"))).expanduser()
 SCREENCAST_QUALITY = 85
 _PASS = os.environ.get("BROWSER_RELAY_PASS", "")
+_TRUSTED_PROXY_TOKEN = os.environ.get("BROWSER_RELAY_TRUSTED_PROXY_TOKEN", "")
+PROXY_SERVER = os.environ.get("BROWSER_RELAY_PROXY_SERVER", "").strip()
+ALLOWED_ORIGIN = os.environ.get("BROWSER_RELAY_ALLOWED_ORIGIN", "").strip()
 # 登录凭证：客户端发 sha256(密码)；会话 cookie 是另一个派生值，由服务器以 HttpOnly 下发，
 # 页面里的 JS 拿不到，也推不回密码哈希。
 AUTH_TOKEN = hashlib.sha256(_PASS.encode()).hexdigest()
@@ -57,6 +60,15 @@ def find_chrome():
         if path:
             return path
 
+    # Playwright keeps versioned Chromium builds under this cache on Linux.
+    # The exact revision changes when Playwright is upgraded, so never pin a
+    # symlink to one revision: choose the newest executable that is present.
+    linux_pw_cache = Path.home() / ".cache/ms-playwright"
+    for d in sorted(linux_pw_cache.glob("chromium-*"), reverse=True):
+        chrome = d / "chrome-linux64/chrome"
+        if chrome.is_file() and os.access(chrome, os.X_OK):
+            return str(chrome)
+
     pw_cache = Path.home() / "Library/Caches/ms-playwright"
     for d in sorted(pw_cache.glob("chromium-*"), reverse=True):
         app = d / "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
@@ -78,6 +90,7 @@ class BrowserRelay:
         self._last_frame = None
         self._send_lock = asyncio.Lock()
         self._reader_task = None
+        self._health_task = None
         self._cdp_alive = asyncio.Event()
         self._switching = False
 
@@ -237,6 +250,8 @@ class BrowserRelay:
             "--profile-directory=Default",
             "about:blank",
         ]
+        if PROXY_SERVER:
+            args.insert(-1, f"--proxy-server={PROXY_SERVER}")
         if sys.platform.startswith("linux"):
             args.insert(-1, "--no-sandbox")
             args.insert(-1, "--disable-dev-shm-usage")
@@ -272,6 +287,35 @@ class BrowserRelay:
         await self.cdp_call("Page.navigate", {"url": "https://www.google.com"})
 
         print(f"浏览器已启动 viewport={self.width}x{self.height}")
+
+    async def _browser_health_watchdog(self):
+        """Restart the whole service when Chrome exits or CDP stays unavailable."""
+        cdp_failures = 0
+        while self._running:
+            await asyncio.sleep(10)
+
+            if self.chrome_proc and self.chrome_proc.poll() is not None:
+                print(f"Chrome 已退出 (code={self.chrome_proc.returncode})，请求 systemd 重启浏览器服务")
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=2
+                ) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"CDP HTTP {resp.status}")
+                cdp_failures = 0
+            except Exception as e:
+                cdp_failures += 1
+                print(f"CDP 健康检查失败 {cdp_failures}/3: {e}")
+                if cdp_failures >= 3:
+                    print("CDP 连续失联，请求 systemd 重启浏览器服务")
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+
+    def start_health_watchdog(self):
+        self._health_task = asyncio.create_task(self._browser_health_watchdog())
 
     async def _safe_send(self, ws, data):
         try:
@@ -345,6 +389,24 @@ class BrowserRelay:
                 "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1,
             })
 
+        elif t == "drag_start":
+            await self.cdp_fire("Input.dispatchMouseEvent", {
+                "type": "mousePressed", "x": msg["x"], "y": msg["y"],
+                "button": "left", "buttons": 1, "clickCount": 1,
+            })
+
+        elif t == "drag_move":
+            await self.cdp_fire("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": msg["x"], "y": msg["y"],
+                "button": "left", "buttons": 1,
+            })
+
+        elif t == "drag_end":
+            await self.cdp_fire("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "x": msg["x"], "y": msg["y"],
+                "button": "left", "buttons": 0, "clickCount": 1,
+            })
+
         elif t == "scroll":
             x, y = msg.get("x", self.width // 2), msg.get("y", self.height // 2)
             dx, dy = msg.get("deltaX", 0), msg.get("deltaY", 0)
@@ -384,6 +446,8 @@ class BrowserRelay:
 
     async def stop(self):
         self._running = False
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
         if self.cdp_ws:
@@ -414,11 +478,30 @@ def _check_cookie(request):
     return False
 
 
+def _check_trusted_proxy(request):
+    """Accept only the high-entropy token injected by our local TLS reverse proxy."""
+    if not _TRUSTED_PROXY_TOKEN:
+        return False
+    return _safe_equal(
+        request.headers.get("X-Relay-Trusted", ""),
+        _TRUSTED_PROXY_TOKEN,
+    )
+
+
 def process_request(connection, request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
-        if not _check_cookie(request):
+        if ALLOWED_ORIGIN and request.headers.get("Origin", "") != ALLOWED_ORIGIN:
+            return Response(403, "Forbidden", Headers(), b"bad origin")
+        if not (_check_cookie(request) or _check_trusted_proxy(request)):
             return Response(403, "Forbidden", Headers(), b"unauthorized")
         return
+
+    if _check_trusted_proxy(request):
+        try:
+            html = CLIENT_HTML.read_bytes()
+            return Response(200, "OK", Headers([("Content-Type", "text/html; charset=utf-8")]), html)
+        except FileNotFoundError:
+            return Response(404, "Not Found", Headers(), b"client.html not found")
 
     auth_header = request.headers.get("X-Relay-Auth")
     if auth_header is not None:
@@ -458,6 +541,7 @@ async def main():
 
     relay = BrowserRelay(width=args.width, height=args.height)
     await relay.start_browser()
+    relay.start_health_watchdog()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_event_loop()
